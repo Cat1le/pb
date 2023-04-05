@@ -205,7 +205,7 @@ impl PixelProvider {
         let [r, g, b] = rgb.get_pixel(dx, dy).0;
         let ColorId { id, exact } = Self::resolve_color_id(r, g, b);
         if !exact {
-            println!("Warning: pixel {{{dx}:{dy}}} is not exactly match allowed colors. Converted to {id:x}");
+            warn!("Pixel {{{dx}:{dy}}} is not exactly match allowed colors. Converted to {id:x}");
         }
         Some(PixelInfo {
             x: self.current.0,
