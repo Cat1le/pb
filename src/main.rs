@@ -86,19 +86,22 @@ impl Bot {
         let this = self.clone();
         tokio::spawn(async move {
             while let Some(msg) = this.connection.lock().await.next().await {
-                if matches!(
-                    msg,
+                match msg {
                     Ok(tungstenite::Message::Close(..))
-                        | Err(tungstenite::Error::ConnectionClosed
-                            | tungstenite::Error::AlreadyClosed)
-                ) {
-                    info!(
-                        "Worker #{} had troubles with connection ({}), trying to reconnect.",
-                        this.id,
-                        msg.unwrap_err()
-                    );
-                    *this.connection.lock().await = Self::connect(&this.url).await.unwrap();
-                    info!("Worker #{} successfully reconnected", this.id);
+                    | Err(
+                        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed,
+                    ) => {
+                        info!(
+                            "Worker #{} had troubles with connection: {}; trying to reconnect.",
+                            this.id,
+                            msg.unwrap_err()
+                        );
+                        *this.connection.lock().await = Self::connect(&this.url).await.unwrap();
+                        info!("Worker #{} successfully reconnected", this.id);
+                    }
+                    // Idk how to deal. C'mon, just ignore
+                    Err(why) => error!("Worker #{} received unexpected error: {}", this.id, why),
+                    _ => {}
                 }
             }
         });
