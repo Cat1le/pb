@@ -1,4 +1,6 @@
-use std::{cmp, env, fs::File, path::PathBuf, sync::Arc, time::Duration};
+use std::sync::Arc;
+
+use std::{cmp, env, fs::File, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use async_tungstenite::tungstenite;
@@ -12,9 +14,12 @@ use image::DynamicImage;
 use lazy_static::lazy_static;
 use log::*;
 
-use rand::{Rng, SeedableRng};
+use rand::distributions::uniform::{UniformDuration, UniformSampler};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -44,13 +49,39 @@ async fn main() -> anyhow::Result<()> {
         config.brush.offset_x,
         config.brush.offset_y,
     )?));
+    let sleep = SleepPerformer::new(UniformDuration::new_inclusive(
+        Duration::from_secs(65),
+        Duration::from_secs(180),
+    ));
     let handles = FuturesUnordered::new();
     for (i, url) in config.bots.into_iter().enumerate() {
-        let bot = Bot::new(i as i32, url, pixel.clone()).await?;
-        handles.push(tokio::spawn(async move { bot.start().await }));
+        let bot = Bot::new(i as i32, url, pixel.clone(), sleep.clone()).await?;
+        handles.push(tokio::spawn(async move { bot.run().await }));
     }
     handles.collect::<Vec<_>>().await;
     Ok(())
+}
+
+#[derive(Clone)]
+struct SleepPerformer {
+    rng: Arc<Mutex<StdRng>>,
+    uniform: UniformDuration,
+}
+
+impl SleepPerformer {
+    fn new(uniform: UniformDuration) -> Self {
+        Self {
+            rng: Arc::new(Mutex::new(StdRng::from_entropy())),
+            uniform,
+        }
+    }
+
+    async fn perform(&mut self) -> JoinHandle<()> {
+        let duration = self.uniform.sample(&mut *self.rng.lock().await);
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
 }
 
 type WStream = WebSocketStream<
@@ -64,51 +95,83 @@ struct Bot {
     id: i32,
     url: Url,
     pixel: Arc<Mutex<PixelProvider>>,
-    connection: Mutex<WStream>,
+    sleep: SleepPerformer,
+    connection: WStream,
 }
 
 impl Bot {
-    async fn new(id: i32, url: Url, pixel: Arc<Mutex<PixelProvider>>) -> anyhow::Result<Arc<Self>> {
-        Ok(Arc::new(Self {
+    async fn new(
+        id: i32,
+        url: Url,
+        pixel: Arc<Mutex<PixelProvider>>,
+        sleep: SleepPerformer,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             id,
             url: url.clone(),
             pixel,
-            connection: Mutex::new(Self::connect(&url).await?),
-        }))
+            sleep,
+            connection: Self::connect(&url).await?,
+        })
     }
 
     async fn connect(url: &Url) -> anyhow::Result<WStream> {
         Ok(connect_async(url).await.map(|x| x.0)?)
     }
 
-    async fn start(self: Arc<Self>) {
-        info!("Worker #{} started", self.id);
-        let this = self.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = this.connection.lock().await.next().await {
-                match msg {
-                    Ok(tungstenite::Message::Close(..))
-                    | Err(
-                        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed,
-                    ) => {
-                        info!(
-                            "Worker #{} had troubles with connection: {}; trying to reconnect.",
-                            this.id,
-                            msg.unwrap_err()
-                        );
-                        *this.connection.lock().await = Self::connect(&this.url).await.unwrap();
-                        info!("Worker #{} successfully reconnected", this.id);
-                    }
-                    // Idk how to deal. C'mon, just ignore
-                    Err(why) => error!("Worker #{} received unexpected error: {}", this.id, why),
-                    _ => {}
+    async fn run(mut self) {
+        info!("Worker #{} started.", self.id);
+        let mut timer = tokio::spawn(async {});
+        while let Some(msg) = self.connection.next().await {
+            match msg {
+                Ok(tungstenite::Message::Close(..))
+                | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                    info!(
+                        "Worker #{} connection was closed; trying to reconnect.",
+                        self.id,
+                    );
+                    self.connection = Self::connect(&self.url).await.unwrap();
+                    info!("Worker #{} successfully reconnected", self.id);
+                    continue;
                 }
+                // Idk how to deal. C'mon, just ignore
+                Err(why) => {
+                    error!(
+                        "Worker #{} received unexpected error: {}; exiting.",
+                        self.id, why
+                    );
+                    break;
+                }
+                _ => {}
             }
-        });
-        while let Some(msg) = self.pixel.lock().await.get_packed_pixel() {
-            drop(self.connection.lock().await.send(msg.into()).await);
-            let mut rng = rand::rngs::StdRng::from_entropy();
-            tokio::time::sleep(Duration::from_secs(rng.gen_range(65..=180))).await;
+            if timer.is_finished() {
+                match self.pixel.lock().await.get_pixel() {
+                    Some(pixel) => {
+                        info!(
+                            "Worker #{} painting {{{}:{}}} to {}",
+                            self.id, pixel.x, pixel.y, pixel.color_id
+                        );
+                        for i in 0..5 {
+                            if let Err(why) = self
+                                .connection
+                                .send(PixelProvider::pack(pixel.clone()).into())
+                                .await
+                            {
+                                error!(
+                                    "Worker #{} cannot send data: {why}; attempt {}/5",
+                                    self.id,
+                                    i + 1
+                                );
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    None => return,
+                }
+                timer = self.sleep.perform().await;
+            }
         }
     }
 }
@@ -129,7 +192,7 @@ lazy_static! {
     .collect::<Vec<_>>();
 }
 
-pub struct PixelProvider {
+struct PixelProvider {
     image: DynamicImage,
     initial: (u32, u32),
     current: (u32, u32),
@@ -143,7 +206,7 @@ impl PixelProvider {
     const SIZE: i32 = 636000;
 
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(image: PathBuf, x: u32, y: u32) -> anyhow::Result<Self> {
+    fn new(image: PathBuf, x: u32, y: u32) -> anyhow::Result<Self> {
         if x >= Self::MAX_WIDTH as u32 {
             Err(anyhow!("X axis is out of range"))?
         }
@@ -158,7 +221,16 @@ impl PixelProvider {
         })
     }
 
-    pub fn resolve_color_id(r: u8, g: u8, b: u8) -> ColorId {
+    #[allow(clippy::erasing_op)]
+    fn pack(info: PixelInfo) -> Vec<u8> {
+        let PixelInfo { x, y, color_id } = info;
+        let value = x as i32
+            + y as i32 * Self::MAX_WIDTH
+            + Self::SIZE * (color_id as i32 + 0 * Self::MAX_COLOR_ID);
+        value.to_le_bytes().into()
+    }
+
+    fn resolve_color_id(r: u8, g: u8, b: u8) -> ColorId {
         let mut nearest = None;
         for (index, (r1, g1, b1)) in COLORS.iter().enumerate() {
             let temp = ((cmp::max(r, *r1) - cmp::min(r, *r1)) as u32).pow(2)
@@ -184,7 +256,7 @@ impl PixelProvider {
         }
     }
 
-    pub fn get_pixel(&mut self) -> Option<PixelInfo> {
+    fn get_pixel(&mut self) -> Option<PixelInfo> {
         if self.end {
             return None;
         }
@@ -217,27 +289,24 @@ impl PixelProvider {
         })
     }
 
-    #[allow(clippy::erasing_op)]
-    pub fn get_packed_pixel(&mut self) -> Option<Vec<u8>> {
-        let PixelInfo { x, y, color_id } = match self.get_pixel() {
+    fn get_packed_pixel(&mut self) -> Option<Vec<u8>> {
+        let info = match self.get_pixel() {
             Some(pixel) => pixel,
             None => return None,
         };
-        let value = x as i32
-            + y as i32 * Self::MAX_WIDTH
-            + Self::SIZE * (color_id as i32 + 0 * Self::MAX_COLOR_ID);
-        Some(value.to_le_bytes().into())
+        Some(Self::pack(info))
     }
 }
 
 #[derive(Debug)]
-pub struct ColorId {
-    pub id: u8,
-    pub exact: bool,
+struct ColorId {
+    id: u8,
+    exact: bool,
 }
 
-pub struct PixelInfo {
-    pub x: u32,
-    pub y: u32,
-    pub color_id: u8,
+#[derive(Clone)]
+struct PixelInfo {
+    x: u32,
+    y: u32,
+    color_id: u8,
 }
