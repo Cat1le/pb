@@ -4,6 +4,7 @@ use std::{cmp, env, fs::File, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use async_tungstenite::tungstenite;
+use async_tungstenite::tungstenite::handshake::client::Request;
 use async_tungstenite::{
     stream::Stream,
     tokio::{connect_async, TokioAdapter},
@@ -76,6 +77,11 @@ impl SleepPerformer {
         }
     }
 
+    fn exact(&self, secs: u64) -> JoinHandle<()> {
+        let duration = Duration::from_secs(secs);
+        tokio::spawn(async move { tokio::time::sleep(duration).await; })
+    }
+
     async fn perform(&mut self) -> JoinHandle<()> {
         let duration = self.uniform.sample(&mut *self.rng.lock().await);
         tokio::spawn(async move {
@@ -121,6 +127,7 @@ impl Bot {
 
     async fn run(mut self) {
         info!("Worker #{} started.", self.id);
+        let mut ping_timer = tokio::spawn(async {});
         let mut timer = tokio::spawn(async {});
         while let Some(msg) = self.connection.next().await {
             match msg {
@@ -131,9 +138,10 @@ impl Bot {
                         self.id,
                     );
                     self.connection = Self::connect(&self.url).await.unwrap();
-                    info!("Worker #{} successfully reconnected", self.id);
+                    info!("Worker #{} reconnected", self.id);
                     continue;
                 }
+                Ok(msg) => info!("Message {msg}"),
                 // Idk how to deal. C'mon, just ignore
                 Err(why) => {
                     error!(
@@ -142,31 +150,24 @@ impl Bot {
                     );
                     break;
                 }
-                _ => {}
             }
-            if timer.is_finished() {
+            if ping_timer.is_finished() {
+                self.connection
+                    .send(tungstenite::Message::Ping("ping".into()))
+                    .await
+                    .unwrap();
+                ping_timer = self.sleep.exact(30);
+            } else if timer.is_finished() {
                 match self.pixel.lock().await.get_pixel() {
                     Some(pixel) => {
                         info!(
                             "Worker #{} painting {{{}:{}}} to {}",
                             self.id, pixel.x, pixel.y, pixel.color_id
                         );
-                        for i in 0..5 {
-                            if let Err(why) = self
-                                .connection
-                                .send(PixelProvider::pack(pixel.clone()).into())
-                                .await
-                            {
-                                error!(
-                                    "Worker #{} cannot send data: {why}; attempt {}/5",
-                                    self.id,
-                                    i + 1
-                                );
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                            } else {
-                                break;
-                            }
-                        }
+                        self.connection
+                            .send(PixelProvider::pack(pixel.clone()).into())
+                            .await
+                            .unwrap();
                     }
                     None => return,
                 }
@@ -282,13 +283,15 @@ impl PixelProvider {
         if !exact {
             warn!("Pixel {{{dx}:{dy}}} is not exactly match allowed colors. Converted to {id:x}");
         }
+        self.current.0 += 1;
         Some(PixelInfo {
-            x: self.current.0,
+            x: self.current.0 - 1,
             y: self.current.1,
             color_id: id,
         })
     }
 
+    #[allow(dead_code)]
     fn get_packed_pixel(&mut self) -> Option<Vec<u8>> {
         let info = match self.get_pixel() {
             Some(pixel) => pixel,
