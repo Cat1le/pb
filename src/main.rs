@@ -4,7 +4,7 @@ use std::{cmp, env, fs::File, path::PathBuf, time::Duration};
 
 use anyhow::anyhow;
 use async_tungstenite::tungstenite;
-use async_tungstenite::tungstenite::handshake::client::Request;
+
 use async_tungstenite::{
     stream::Stream,
     tokio::{connect_async, TokioAdapter},
@@ -79,7 +79,9 @@ impl SleepPerformer {
 
     fn exact(&self, secs: u64) -> JoinHandle<()> {
         let duration = Duration::from_secs(secs);
-        tokio::spawn(async move { tokio::time::sleep(duration).await; })
+        tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+        })
     }
 
     async fn perform(&mut self) -> JoinHandle<()> {
@@ -201,17 +203,17 @@ struct PixelProvider {
 }
 
 impl PixelProvider {
-    const MAX_COLOR_ID: i32 = 25;
-    const MAX_HEIGHT: i32 = 400;
-    const MAX_WIDTH: i32 = 1590;
-    const SIZE: i32 = 636000;
+    const MAX_COLOR_ID: u32 = 25;
+    const MAX_HEIGHT: u32 = 400;
+    const MAX_WIDTH: u32 = 1590;
+    const SIZE: u32 = 636000;
 
     #[allow(clippy::new_ret_no_self)]
     fn new(image: PathBuf, x: u32, y: u32) -> anyhow::Result<Self> {
-        if x >= Self::MAX_WIDTH as u32 {
+        if x >= Self::MAX_WIDTH {
             Err(anyhow!("X axis is out of range"))?
         }
-        if y >= Self::MAX_HEIGHT as u32 {
+        if y >= Self::MAX_HEIGHT {
             Err(anyhow!("Y axis is out of range"))?
         }
         Ok(Self {
@@ -226,8 +228,8 @@ impl PixelProvider {
     fn pack(info: PixelInfo) -> Vec<u8> {
         let PixelInfo { x, y, color_id } = info;
         let value = x as i32
-            + y as i32 * Self::MAX_WIDTH
-            + Self::SIZE * (color_id as i32 + 0 * Self::MAX_COLOR_ID);
+            + y as i32 * Self::MAX_WIDTH as i32
+            + Self::SIZE as i32 * (color_id as i32 + 0 * Self::MAX_COLOR_ID as i32);
         value.to_le_bytes().into()
     }
 
@@ -259,6 +261,10 @@ impl PixelProvider {
 
     fn get_pixel(&mut self) -> Option<PixelInfo> {
         if self.end {
+            return None;
+        }
+        if self.current.0 >= Self::MAX_WIDTH || self.current.1 >= Self::MAX_WIDTH {
+            self.end = true;
             return None;
         }
         let (dx, dy) = (
